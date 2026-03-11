@@ -534,7 +534,7 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
                 if (!SlotName.IsEmpty() && !SourceTextureBySlot.Contains(SlotName)) {
                     SourceTextureBySlot.Add(SlotName, SourceFile);
                 }
-                if (!(SlotName == TEXT("albedo") || SlotName == TEXT("normal") || SlotName == TEXT("fuzz"))) {
+                if (!(SlotName == TEXT("albedo") || SlotName == TEXT("normal") || SlotName == TEXT("fuzz") || SlotName == TEXT("displacement"))) {
                     continue;
                 }
                 UAssetImportTask* Task = NewObject<UAssetImportTask>();
@@ -548,7 +548,7 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
                 if (SlotName == TEXT("displacement")) {
                     UTextureFactory* Factory = NewObject<UTextureFactory>();
                     Factory->CompressionSettings = TC_Displacementmap;
-                    Factory->SRGB = false;
+                    Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
                     Task->Factory = Factory;
                 }
                 
