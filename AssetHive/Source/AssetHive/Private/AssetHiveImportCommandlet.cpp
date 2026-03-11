@@ -119,6 +119,18 @@ static void EmitProgress(int32 Percent, const FString& Stage)
 {
     const int32 Clamped = FMath::Clamp(Percent, 0, 100);
     UE_LOG(LogTemp, Display, TEXT("[AssetHiveProgress]%d|%s"), Clamped, *Stage);
+    const FString ProgressPath = FPaths::Combine(FPlatformProcess::UserDir(), TEXT("AssetHive"), TEXT("import-progress.json"));
+    const FString ProgressDir = FPaths::GetPath(ProgressPath);
+    IFileManager::Get().MakeDirectory(*ProgressDir, true);
+    TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetNumberField(TEXT("percent"), Clamped);
+    Root->SetStringField(TEXT("stage"), Stage);
+    Root->SetBoolField(TEXT("inProgress"), Clamped < 100);
+    Root->SetNumberField(TEXT("timestamp"), static_cast<double>(FDateTime::UtcNow().ToUnixTimestamp() * 1000));
+    FString OutJson;
+    const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutJson);
+    FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
+    FFileHelper::SaveStringToFile(OutJson, *ProgressPath);
 }
 
 static void WriteImportSignal(const FString& FolderPath)
@@ -334,6 +346,86 @@ static UTexture2D* CreatePackedMaskTexture(
     return PackedTexture;
 }
 
+static UTexture2D* CreatePackedDROTexture(
+    const FString& AssetFolder,
+    const FString& AssetName,
+    UTexture2D* DisplacementTexture,
+    int32 DisplacementChannel,
+    UTexture2D* RoughnessTexture,
+    int32 RoughnessChannel,
+    UTexture2D* OpacityTexture,
+    int32 OpacityChannel,
+    UTexture2D* SizeRefA,
+    UTexture2D* SizeRefB
+)
+{
+    FTexturePixels DisplacementPixels;
+    FTexturePixels RoughnessPixels;
+    FTexturePixels OpacityPixels;
+    const bool HasDisplacement = ReadTexturePixels(DisplacementTexture, DisplacementPixels);
+    const bool HasRoughness = ReadTexturePixels(RoughnessTexture, RoughnessPixels);
+    const bool HasOpacity = ReadTexturePixels(OpacityTexture, OpacityPixels);
+    int32 Width = 0;
+    int32 Height = 0;
+    if (HasDisplacement) {
+        Width = DisplacementPixels.Width;
+        Height = DisplacementPixels.Height;
+    } else if (HasRoughness) {
+        Width = RoughnessPixels.Width;
+        Height = RoughnessPixels.Height;
+    } else if (HasOpacity) {
+        Width = OpacityPixels.Width;
+        Height = OpacityPixels.Height;
+    } else {
+        FTexturePixels RefPixels;
+        if (ReadTexturePixels(SizeRefA, RefPixels) || ReadTexturePixels(SizeRefB, RefPixels)) {
+            Width = RefPixels.Width;
+            Height = RefPixels.Height;
+        } else {
+            Width = 1024;
+            Height = 1024;
+        }
+    }
+
+    const FString TextureAssetName = FString::Printf(TEXT("T_%s_DRO"), *AssetName);
+    const FString PackagePath = AssetFolder / TextureAssetName;
+    UPackage* Package = CreatePackage(*PackagePath);
+    if (!Package) {
+        return nullptr;
+    }
+
+    UTexture2D* PackedTexture = NewObject<UTexture2D>(Package, *TextureAssetName, RF_Public | RF_Standalone);
+    if (!PackedTexture) {
+        return nullptr;
+    }
+
+    PackedTexture->Source.Init(Width, Height, 1, 1, TSF_BGRA8);
+    uint8* DestData = PackedTexture->Source.LockMip(0);
+    for (int32 Y = 0; Y < Height; Y++) {
+        for (int32 X = 0; X < Width; X++) {
+            const float U = Width > 1 ? static_cast<float>(X) / static_cast<float>(Width - 1) : 0.0f;
+            const float V = Height > 1 ? static_cast<float>(Y) / static_cast<float>(Height - 1) : 0.0f;
+            const uint8 DisplacementValue = SampleChannel(HasDisplacement ? &DisplacementPixels : nullptr, U, V, DisplacementChannel, static_cast<uint8>(128));
+            const uint8 RoughnessValue = SampleChannel(HasRoughness ? &RoughnessPixels : nullptr, U, V, RoughnessChannel, static_cast<uint8>(204));
+            const uint8 OpacityValue = SampleChannel(HasOpacity ? &OpacityPixels : nullptr, U, V, OpacityChannel, static_cast<uint8>(255));
+            const int32 DestIndex = (Y * Width + X) * 4;
+            DestData[DestIndex + 0] = DisplacementValue;
+            DestData[DestIndex + 1] = RoughnessValue;
+            DestData[DestIndex + 2] = OpacityValue;
+            DestData[DestIndex + 3] = 255;
+        }
+    }
+    PackedTexture->Source.UnlockMip(0);
+    PackedTexture->CompressionSettings = TC_Masks;
+    PackedTexture->CompressionNoAlpha = true;
+    PackedTexture->SRGB = false;
+    PackedTexture->PostEditChange();
+    PackedTexture->MarkPackageDirty();
+    FAssetRegistryModule::AssetCreated(PackedTexture);
+    SavePackageForObject(PackedTexture);
+    return PackedTexture;
+}
+
 static UMaterialInstanceConstant* CreateAssetMaterialInstance(
     const FString& AssetFolder,
     const FString& AssetName,
@@ -377,6 +469,53 @@ static UMaterialInstanceConstant* CreateAssetMaterialInstance(
     }
     if (FuzzTexture) {
         UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(MaterialInstance, FName(TEXT("fuzzmap")), FuzzTexture);
+    }
+
+    MaterialInstance->PostEditChange();
+    MaterialInstance->MarkPackageDirty();
+    if (bIsNew) {
+        FAssetRegistryModule::AssetCreated(MaterialInstance);
+    }
+    SavePackageForObject(MaterialInstance);
+    return MaterialInstance;
+}
+
+static UMaterialInstanceConstant* CreateDecalMaterialInstance(
+    const FString& AssetFolder,
+    const FString& AssetName,
+    UTexture* AlbedoTexture,
+    UTexture* NormalTexture,
+    UTexture* DROTexture
+)
+{
+    const TCHAR* ParentPath = TEXT("/Game/Common/MaterialInstance/MMI_GeneralDecal.MMI_GeneralDecal");
+    UMaterialInterface* ParentMaterial = Cast<UMaterialInterface>(StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, ParentPath));
+    if (!ParentMaterial) {
+        UE_LOG(LogTemp, Warning, TEXT("Missing parent material: %s"), ParentPath);
+        return nullptr;
+    }
+
+    const FString MaterialAssetName = FString::Printf(TEXT("MI_%s"), *AssetName);
+    const FString MaterialPackagePath = AssetFolder / MaterialAssetName;
+    UPackage* MaterialPackage = CreatePackage(*MaterialPackagePath);
+    UMaterialInstanceConstant* MaterialInstance = FindObject<UMaterialInstanceConstant>(MaterialPackage, *MaterialAssetName);
+    const bool bIsNew = MaterialInstance == nullptr;
+    if (!MaterialInstance) {
+        MaterialInstance = NewObject<UMaterialInstanceConstant>(MaterialPackage, *MaterialAssetName, RF_Public | RF_Standalone);
+    }
+    if (!MaterialInstance) {
+        return nullptr;
+    }
+    MaterialInstance->SetParentEditorOnly(ParentMaterial);
+
+    if (AlbedoTexture) {
+        UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(MaterialInstance, FName(TEXT("Albedo")), AlbedoTexture);
+    }
+    if (DROTexture) {
+        UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(MaterialInstance, FName(TEXT("DRO")), DROTexture);
+    }
+    if (NormalTexture) {
+        UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(MaterialInstance, FName(TEXT("Normal")), NormalTexture);
     }
 
     MaterialInstance->PostEditChange();
@@ -446,6 +585,10 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
         FString AssetId = TEXT("");
         AssetObject->TryGetStringField(TEXT("name"), AssetName);
         AssetObject->TryGetStringField(TEXT("id"), AssetId);
+        FString AssetType = TEXT("");
+        AssetObject->TryGetStringField(TEXT("assetType"), AssetType);
+        AssetType = AssetType.ToLower();
+        const bool bIsDecal = AssetType == TEXT("decal");
         if (AssetId.IsEmpty()) {
             AssetId = TEXT("UnknownId");
         }
@@ -534,7 +677,9 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
                 if (!SlotName.IsEmpty() && !SourceTextureBySlot.Contains(SlotName)) {
                     SourceTextureBySlot.Add(SlotName, SourceFile);
                 }
-                if (!(SlotName == TEXT("albedo") || SlotName == TEXT("normal") || SlotName == TEXT("fuzz") || SlotName == TEXT("displacement"))) {
+                const bool bAllow3DSlots = SlotName == TEXT("albedo") || SlotName == TEXT("normal") || SlotName == TEXT("fuzz") || SlotName == TEXT("displacement");
+                const bool bAllowDecalSlots = SlotName == TEXT("albedo") || SlotName == TEXT("normal");
+                if ((bIsDecal && !bAllowDecalSlots) || (!bIsDecal && !bAllow3DSlots)) {
                     continue;
                 }
                 UAssetImportTask* Task = NewObject<UAssetImportTask>();
@@ -566,44 +711,72 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
             }
         }
 
-        SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)), FString::Printf(TEXT("合成 M 贴图: %s"), *AssetName));
-        UTexture2D* AOSourceTexture = SourceTextureBySlot.Contains(TEXT("ao")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("ao")]) : nullptr;
-        UTexture2D* RoughnessSourceTexture = SourceTextureBySlot.Contains(TEXT("roughness")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("roughness")]) : nullptr;
-        UTexture2D* DisplacementSourceTexture = SourceTextureBySlot.Contains(TEXT("displacement")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("displacement")]) : nullptr;
-        UTexture2D* ORDPSourceTexture = SourceTextureBySlot.Contains(TEXT("ordp")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("ordp")]) : nullptr;
-        const FString AOPath = SourceTextureBySlot.Contains(TEXT("ao")) ? SourceTextureBySlot[TEXT("ao")] : TEXT("");
-        const FString RoughnessPath = SourceTextureBySlot.Contains(TEXT("roughness")) ? SourceTextureBySlot[TEXT("roughness")] : TEXT("");
-        const FString DisplacementPath = SourceTextureBySlot.Contains(TEXT("displacement")) ? SourceTextureBySlot[TEXT("displacement")] : TEXT("");
-        const FString ORDPPath = SourceTextureBySlot.Contains(TEXT("ordp")) ? SourceTextureBySlot[TEXT("ordp")] : TEXT("");
-        UE_LOG(LogTemp, Display, TEXT("AssetHive mask sources [%s] AO=%s Roughness=%s Displacement=%s ORDP=%s"), *AssetStem, *AOPath, *RoughnessPath, *DisplacementPath, *ORDPPath);
-        UE_LOG(LogTemp, Display, TEXT("AssetHive mask source load [%s] AO=%d Roughness=%d Displacement=%d ORDP=%d"), *AssetStem, AOSourceTexture != nullptr ? 1 : 0, RoughnessSourceTexture != nullptr ? 1 : 0, DisplacementSourceTexture != nullptr ? 1 : 0, ORDPSourceTexture != nullptr ? 1 : 0);
-        UTexture2D* AOTexture = AOSourceTexture ? AOSourceTexture : ORDPSourceTexture;
-        UTexture2D* RoughnessTexture = RoughnessSourceTexture ? RoughnessSourceTexture : ORDPSourceTexture;
-        UTexture2D* DisplacementTexture = DisplacementSourceTexture ? DisplacementSourceTexture : ORDPSourceTexture;
-        const int32 AOChannel = AOSourceTexture ? 0 : (ORDPSourceTexture ? 0 : 0);
-        const int32 RoughnessChannel = RoughnessSourceTexture ? 0 : (ORDPSourceTexture ? 1 : 0);
-        const int32 DisplacementChannel = DisplacementSourceTexture ? 0 : (ORDPSourceTexture ? 2 : 0);
-        UTexture2D* MaskTexture = CreatePackedMaskTexture(
-            AssetFolder,
-            AssetStem,
-            AOTexture,
-            AOChannel,
-            RoughnessTexture,
-            RoughnessChannel,
-            DisplacementTexture,
-            DisplacementChannel,
-            Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("albedo"))),
-            Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("normal")))
-        );
-        SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 50, 0, 99)), FString::Printf(TEXT("创建材质实例: %s"), *AssetName));
-        UMaterialInstanceConstant* MaterialInstance = CreateAssetMaterialInstance(
-            AssetFolder,
-            AssetStem,
-            TextureBySlot.FindRef(TEXT("albedo")),
-            TextureBySlot.FindRef(TEXT("normal")),
-            MaskTexture,
-            TextureBySlot.FindRef(TEXT("fuzz"))
-        );
+        UMaterialInstanceConstant* MaterialInstance = nullptr;
+        if (bIsDecal) {
+            SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)), FString::Printf(TEXT("合成 DRO 贴图: %s"), *AssetName));
+            UTexture2D* DisplacementSourceTexture = SourceTextureBySlot.Contains(TEXT("displacement")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("displacement")]) : nullptr;
+            UTexture2D* RoughnessSourceTexture = SourceTextureBySlot.Contains(TEXT("roughness")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("roughness")]) : nullptr;
+            UTexture2D* OpacitySourceTexture = SourceTextureBySlot.Contains(TEXT("opacity")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("opacity")]) : nullptr;
+            UTexture2D* DROTexture = CreatePackedDROTexture(
+                AssetFolder,
+                AssetStem,
+                DisplacementSourceTexture,
+                0,
+                RoughnessSourceTexture,
+                0,
+                OpacitySourceTexture,
+                0,
+                Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("albedo"))),
+                Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("normal")))
+            );
+            SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 50, 0, 99)), FString::Printf(TEXT("创建 Decal 材质实例: %s"), *AssetName));
+            MaterialInstance = CreateDecalMaterialInstance(
+                AssetFolder,
+                AssetStem,
+                TextureBySlot.FindRef(TEXT("albedo")),
+                TextureBySlot.FindRef(TEXT("normal")),
+                DROTexture
+            );
+        } else {
+            SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)), FString::Printf(TEXT("合成 M 贴图: %s"), *AssetName));
+            UTexture2D* AOSourceTexture = SourceTextureBySlot.Contains(TEXT("ao")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("ao")]) : nullptr;
+            UTexture2D* RoughnessSourceTexture = SourceTextureBySlot.Contains(TEXT("roughness")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("roughness")]) : nullptr;
+            UTexture2D* DisplacementSourceTexture = SourceTextureBySlot.Contains(TEXT("displacement")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("displacement")]) : nullptr;
+            UTexture2D* ORDPSourceTexture = SourceTextureBySlot.Contains(TEXT("ordp")) ? FImageUtils::ImportFileAsTexture2D(SourceTextureBySlot[TEXT("ordp")]) : nullptr;
+            const FString AOPath = SourceTextureBySlot.Contains(TEXT("ao")) ? SourceTextureBySlot[TEXT("ao")] : TEXT("");
+            const FString RoughnessPath = SourceTextureBySlot.Contains(TEXT("roughness")) ? SourceTextureBySlot[TEXT("roughness")] : TEXT("");
+            const FString DisplacementPath = SourceTextureBySlot.Contains(TEXT("displacement")) ? SourceTextureBySlot[TEXT("displacement")] : TEXT("");
+            const FString ORDPPath = SourceTextureBySlot.Contains(TEXT("ordp")) ? SourceTextureBySlot[TEXT("ordp")] : TEXT("");
+            UE_LOG(LogTemp, Display, TEXT("AssetHive mask sources [%s] AO=%s Roughness=%s Displacement=%s ORDP=%s"), *AssetStem, *AOPath, *RoughnessPath, *DisplacementPath, *ORDPPath);
+            UE_LOG(LogTemp, Display, TEXT("AssetHive mask source load [%s] AO=%d Roughness=%d Displacement=%d ORDP=%d"), *AssetStem, AOSourceTexture != nullptr ? 1 : 0, RoughnessSourceTexture != nullptr ? 1 : 0, DisplacementSourceTexture != nullptr ? 1 : 0, ORDPSourceTexture != nullptr ? 1 : 0);
+            UTexture2D* AOTexture = AOSourceTexture ? AOSourceTexture : ORDPSourceTexture;
+            UTexture2D* RoughnessTexture = RoughnessSourceTexture ? RoughnessSourceTexture : ORDPSourceTexture;
+            UTexture2D* DisplacementTexture = DisplacementSourceTexture ? DisplacementSourceTexture : ORDPSourceTexture;
+            const int32 AOChannel = AOSourceTexture ? 0 : (ORDPSourceTexture ? 0 : 0);
+            const int32 RoughnessChannel = RoughnessSourceTexture ? 0 : (ORDPSourceTexture ? 1 : 0);
+            const int32 DisplacementChannel = DisplacementSourceTexture ? 0 : (ORDPSourceTexture ? 2 : 0);
+            UTexture2D* MaskTexture = CreatePackedMaskTexture(
+                AssetFolder,
+                AssetStem,
+                AOTexture,
+                AOChannel,
+                RoughnessTexture,
+                RoughnessChannel,
+                DisplacementTexture,
+                DisplacementChannel,
+                Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("albedo"))),
+                Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("normal")))
+            );
+            SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 50, 0, 99)), FString::Printf(TEXT("创建材质实例: %s"), *AssetName));
+            MaterialInstance = CreateAssetMaterialInstance(
+                AssetFolder,
+                AssetStem,
+                TextureBySlot.FindRef(TEXT("albedo")),
+                TextureBySlot.FindRef(TEXT("normal")),
+                MaskTexture,
+                TextureBySlot.FindRef(TEXT("fuzz"))
+            );
+        }
         if (MaterialInstance) {
             for (UStaticMesh* StaticMesh : ImportedMeshes) {
                 if (!StaticMesh) {

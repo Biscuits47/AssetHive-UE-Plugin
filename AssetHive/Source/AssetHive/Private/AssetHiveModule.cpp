@@ -98,6 +98,7 @@ void FAssetHiveModule::RegisterMenus()
         + SHorizontalBox::Slot()
         .AutoWidth()
         .VAlign(VAlign_Center)
+        .Padding(8.0f, 0.0f, 0.0f, 0.0f)
         [
             SNew(STextBlock)
             .Text_Lambda([this]() {
