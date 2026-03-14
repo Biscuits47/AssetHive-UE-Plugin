@@ -559,7 +559,7 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
         return 1;
     }
 
-    FString DestinationPath = TEXT("/Game/AssetHive");
+    FString DestinationPath = TEXT("/Game/AssembledHive");
     Root->TryGetStringField(TEXT("destinationPath"), DestinationPath);
 
     const TArray<TSharedPtr<FJsonValue>>* AssetsJson = nullptr;
@@ -587,17 +587,26 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
         AssetObject->TryGetStringField(TEXT("id"), AssetId);
         FString AssetType = TEXT("");
         AssetObject->TryGetStringField(TEXT("assetType"), AssetType);
+        FString AssetSource = TEXT("");
+        AssetObject->TryGetStringField(TEXT("source"), AssetSource);
+        FString CategoryFolder = TEXT("Others");
+        AssetObject->TryGetStringField(TEXT("categoryFolder"), CategoryFolder);
         AssetType = AssetType.ToLower();
+        AssetSource = AssetSource.ToLower();
         const bool bIsDecal = AssetType == TEXT("decal");
+        const bool bIsModelAsset = AssetType == TEXT("3d") || AssetType == TEXT("3dplant");
+        const bool bIsCustomAsset = AssetSource == TEXT("custom");
         if (AssetId.IsEmpty()) {
             AssetId = TEXT("UnknownId");
         }
         const FString SafeAssetName = MakeSafeObjectName(AssetName);
         const FString SafeAssetId = MakeSafeObjectName(AssetId);
+        const FString SafeCategoryFolder = MakeSafeObjectName(CategoryFolder);
         const FString AssetStem = FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
-        const FString AssetFolder = DestinationPath / SafeAssetName;
+        const FString AssetFolder = DestinationPath / SafeCategoryFolder;
 
         TMap<FString, FString> SourceTextureSlotMap;
+        TMap<FString, FString> SourceTextureNormalFormatMap;
         const TArray<TSharedPtr<FJsonValue>>* TextureSlots = nullptr;
         if (AssetObject->TryGetArrayField(TEXT("textureSlots"), TextureSlots) && TextureSlots != nullptr) {
             for (const TSharedPtr<FJsonValue>& SlotValue : *TextureSlots) {
@@ -610,10 +619,15 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
                 }
                 FString SourceFile;
                 FString SlotName;
+                FString NormalMapFormat;
                 SlotObject->TryGetStringField(TEXT("file"), SourceFile);
                 SlotObject->TryGetStringField(TEXT("slot"), SlotName);
                 if (!SourceFile.IsEmpty() && !SlotName.IsEmpty()) {
-                    SourceTextureSlotMap.Add(NormalizePathLower(SourceFile), SlotName.ToLower());
+                    const FString SourceKey = NormalizePathLower(SourceFile);
+                    SourceTextureSlotMap.Add(SourceKey, SlotName.ToLower());
+                    if (SlotObject->TryGetStringField(TEXT("normalMapFormat"), NormalMapFormat) && !NormalMapFormat.IsEmpty()) {
+                        SourceTextureNormalFormatMap.Add(SourceKey, NormalMapFormat.ToLower());
+                    }
                 }
             }
         }
@@ -624,6 +638,17 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
 
         const TArray<TSharedPtr<FJsonValue>>* ModelFiles = nullptr;
         if (AssetObject->TryGetArrayField(TEXT("modelFiles"), ModelFiles) && ModelFiles != nullptr) {
+            int32 ValidModelCount = 0;
+            for (const TSharedPtr<FJsonValue>& FileValue : *ModelFiles) {
+                if (!FileValue.IsValid() || FileValue->Type != EJson::String) {
+                    continue;
+                }
+                const FString SourceFile = FileValue->AsString();
+                if (FPaths::FileExists(SourceFile)) {
+                    ValidModelCount += 1;
+                }
+            }
+            int32 ImportedModelIndex = 0;
             for (const TSharedPtr<FJsonValue>& FileValue : *ModelFiles) {
                 if (!FileValue.IsValid() || FileValue->Type != EJson::String) {
                     continue;
@@ -636,7 +661,17 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
                 UAssetImportTask* Task = NewObject<UAssetImportTask>();
                 Task->Filename = SourceFile;
                 Task->DestinationPath = AssetFolder;
-                Task->DestinationName = FString::Printf(TEXT("SM_%s_%s"), *AssetStem, *DetectModelSuffix(SourceFile));
+                FString ModelAssetName;
+                if (bIsCustomAsset && bIsModelAsset) {
+                    if (ValidModelCount <= 1) {
+                        ModelAssetName = FString::Printf(TEXT("SM_%s"), *AssetStem);
+                    } else {
+                        ModelAssetName = FString::Printf(TEXT("SM_%s_Var%02d"), *AssetStem, ImportedModelIndex + 1);
+                    }
+                } else {
+                    ModelAssetName = FString::Printf(TEXT("SM_%s_%s"), *AssetStem, *DetectModelSuffix(SourceFile));
+                }
+                Task->DestinationName = ModelAssetName;
                 Task->bReplaceExisting = true;
                 Task->bAutomated = true;
                 Task->bSave = true;
@@ -656,6 +691,7 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
                         ImportedMeshes.Add(StaticMesh);
                     }
                 }
+                ImportedModelIndex += 1;
             }
         }
 
@@ -674,6 +710,10 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
                 const FString SlotName = SourceTextureSlotMap.Contains(SourceKey)
                     ? SourceTextureSlotMap[SourceKey]
                     : DetectTextureSlot(SourceFile);
+                const bool bNormalSlot = SlotName == TEXT("normal");
+                const bool bFlipGreenForOpenGL = bNormalSlot
+                    && SourceTextureNormalFormatMap.Contains(SourceKey)
+                    && SourceTextureNormalFormatMap[SourceKey] == TEXT("opengl");
                 if (!SlotName.IsEmpty() && !SourceTextureBySlot.Contains(SlotName)) {
                     SourceTextureBySlot.Add(SlotName, SourceFile);
                 }
@@ -703,6 +743,12 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params)
                 AppendImportedObjects(Task, ImportedObjects);
                 for (UObject* ImportedObject : ImportedObjects) {
                     if (UTexture* Texture = Cast<UTexture>(ImportedObject)) {
+                        if (bNormalSlot) {
+                            Texture->bFlipGreenChannel = bFlipGreenForOpenGL;
+                            Texture->PostEditChange();
+                            Texture->MarkPackageDirty();
+                            SavePackageForObject(Texture);
+                        }
                         if (!SlotName.IsEmpty() && !TextureBySlot.Contains(SlotName)) {
                             TextureBySlot.Add(SlotName, Texture);
                         }

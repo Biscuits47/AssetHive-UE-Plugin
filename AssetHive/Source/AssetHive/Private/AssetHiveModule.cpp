@@ -1,6 +1,9 @@
 #include "AssetHiveModule.h"
+#include "AssetHiveImportCommandlet.h"
 #include "ContentBrowserModule.h"
 #include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "HAL/FileManager.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -25,6 +28,21 @@ static FString GetBridgeHeartbeatPath()
 static FString GetImportSignalPath()
 {
     return FPaths::Combine(FPlatformProcess::UserDir(), TEXT("AssetHive"), TEXT("import-signal.json"));
+}
+
+static FString GetEditorBridgeStatePath()
+{
+    return FPaths::Combine(FPlatformProcess::UserDir(), TEXT("AssetHive"), TEXT("editor-bridge.json"));
+}
+
+static FString GetImportRequestPath()
+{
+    return FPaths::Combine(FPlatformProcess::UserDir(), TEXT("AssetHive"), TEXT("import-request.json"));
+}
+
+static FString GetImportResponsePath()
+{
+    return FPaths::Combine(FPlatformProcess::UserDir(), TEXT("AssetHive"), TEXT("import-response.json"));
 }
 
 void FAssetHiveModule::StartupModule()
@@ -116,6 +134,8 @@ void FAssetHiveModule::RegisterMenus()
 bool FAssetHiveModule::TickConnection(float DeltaTime)
 {
     UpdateConnectionState();
+    WriteEditorBridgeState();
+    ConsumeImportRequest();
     ConsumeImportSignal();
     return true;
 }
@@ -177,5 +197,74 @@ void FAssetHiveModule::ConsumeImportSignal()
         TArray<FString> Folders;
         Folders.Add(FolderPath);
         Browser->SyncBrowserToFolders(Folders);
+    }
+}
+
+void FAssetHiveModule::WriteEditorBridgeState()
+{
+    const FString BridgeDir = FPaths::Combine(FPlatformProcess::UserDir(), TEXT("AssetHive"));
+    IFileManager::Get().MakeDirectory(*BridgeDir, true);
+    const FString ProjectPath = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());
+    TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+    Root->SetStringField(TEXT("projectPath"), ProjectPath);
+    Root->SetStringField(TEXT("pid"), FString::FromInt(FPlatformProcess::GetCurrentProcessId()));
+    Root->SetNumberField(TEXT("timestamp"), static_cast<double>(FDateTime::UtcNow().ToUnixTimestamp()) * 1000.0);
+    FString Serialized;
+    const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Serialized);
+    if (FJsonSerializer::Serialize(Root.ToSharedRef(), Writer)) {
+        FFileHelper::SaveStringToFile(Serialized, *GetEditorBridgeStatePath());
+    }
+}
+
+void FAssetHiveModule::ConsumeImportRequest()
+{
+    const FString RequestPath = GetImportRequestPath();
+    FString RequestContent;
+    if (!FFileHelper::LoadFileToString(RequestContent, *RequestPath)) {
+        return;
+    }
+    TSharedPtr<FJsonObject> RequestJson;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RequestContent);
+    if (!FJsonSerializer::Deserialize(Reader, RequestJson) || !RequestJson.IsValid()) {
+        return;
+    }
+    double TimestampMs = 0.0;
+    if (!RequestJson->TryGetNumberField(TEXT("timestamp"), TimestampMs)) {
+        return;
+    }
+    const int64 Timestamp = static_cast<int64>(TimestampMs);
+    if (Timestamp <= LastImportRequestTimestamp) {
+        return;
+    }
+    FString RequestProjectPath;
+    RequestJson->TryGetStringField(TEXT("projectPath"), RequestProjectPath);
+    const FString CurrentProjectPath = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());
+    if (!RequestProjectPath.IsEmpty() && !RequestProjectPath.Equals(CurrentProjectPath, ESearchCase::IgnoreCase)) {
+        return;
+    }
+    FString JobFile;
+    if (!RequestJson->TryGetStringField(TEXT("jobFile"), JobFile) || JobFile.IsEmpty()) {
+        return;
+    }
+    FString RequestId;
+    RequestJson->TryGetStringField(TEXT("requestId"), RequestId);
+    LastImportRequestTimestamp = Timestamp;
+    UAssetHiveImportCommandlet* Commandlet = NewObject<UAssetHiveImportCommandlet>(GetTransientPackage());
+    int32 ExitCode = 1;
+    FString Message = TEXT("导入失败");
+    if (Commandlet) {
+        const FString Params = FString::Printf(TEXT("Job=\"%s\""), *JobFile);
+        ExitCode = Commandlet->Main(Params);
+        Message = ExitCode == 0 ? TEXT("导入完成") : FString::Printf(TEXT("导入失败，退出码 %d"), ExitCode);
+    }
+    TSharedPtr<FJsonObject> Response = MakeShared<FJsonObject>();
+    Response->SetStringField(TEXT("requestId"), RequestId);
+    Response->SetNumberField(TEXT("timestamp"), static_cast<double>(FDateTime::UtcNow().ToUnixTimestamp()) * 1000.0);
+    Response->SetBoolField(TEXT("ok"), ExitCode == 0);
+    Response->SetStringField(TEXT("message"), Message);
+    FString Serialized;
+    const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Serialized);
+    if (FJsonSerializer::Serialize(Response.ToSharedRef(), Writer)) {
+        FFileHelper::SaveStringToFile(Serialized, *GetImportResponsePath());
     }
 }

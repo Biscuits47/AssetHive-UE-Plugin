@@ -16,12 +16,15 @@ private:
     void RegisterMenus();
     bool TickConnection(float DeltaTime);
     void UpdateConnectionState();
+    void WriteEditorBridgeState();
+    void ConsumeImportRequest();
     void SetupStyle();
     void TeardownStyle();
     void ConsumeImportSignal();
 
     bool bConnectedToAssetHive = false;
     int64 LastImportSignalTimestamp = 0;
+    int64 LastImportRequestTimestamp = 0;
     FTSTicker::FDelegateHandle TickHandle;
     TSharedPtr<FSlateStyleSet> StyleSet;
 };
