@@ -1,0 +1,29 @@
+﻿{
+    "FileVersion":  3,
+    "Version":  1,
+    "VersionName":  "0.1.0",
+    "FriendlyName":  "AssetHive",
+    "Description":  "Commandlet for importing AssetHive assets into Unreal as uasset",
+    "Category":  "Importers",
+    "CreatedBy":  "AssetHive",
+    "CreatedByURL":  "",
+    "DocsURL":  "",
+    "MarketplaceURL":  "",
+    "SupportURL":  "",
+    "CanContainContent":  true,
+    "IsBetaVersion":  true,
+    "Installed":  true,
+    "Modules":  [
+                    {
+                        "Name":  "AssetHive",
+                        "Type":  "Editor",
+                        "LoadingPhase":  "Default"
+                    }
+                ],
+    "Plugins":  [
+                    {
+                        "Name":  "MegascansPlugin",
+                        "Enabled":  false
+                    }
+                ]
+}
